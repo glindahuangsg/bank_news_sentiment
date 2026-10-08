@@ -1,25 +1,20 @@
 import os
+import random
+from datetime import datetime, timedelta
 
-# Set HuggingFace cache to a writable dir BEFORE importing transformers
-os.environ.setdefault("HF_HOME", "/tmp/hf_cache")
-os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf_cache")
-os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-
-import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import random
+import streamlit as st
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
 # ============================================================
 # Constants
 # ============================================================
-SENTIMENT_MODEL_NAME = "pmatorras/financial-sentiment-multi-task"
+SENTIMENT_MODEL_NAME = "pmatorras/financial-sentiment-analysis"
 TOPIC_MODEL_NAME = "leonas5555/finnews-topic-single-classify"
 
 SENTIMENT_COLOR_MAP = {
@@ -28,124 +23,64 @@ SENTIMENT_COLOR_MAP = {
     "Negative": "#e74c3c",
 }
 
-TOPIC_LABELS = [
-    "Analyst Ratings", "Banking", "Commodities", "Company Earnings",
-    "Corporate Governance", "Cryptocurrency", "Economy", "Energy",
-    "Financial Markets", "Healthcare", "Legal/Regulation", "M&A",
-    "Real Estate", "Retail", "Technology", "Telecommunications",
-    "Trade", "Transportation", "Utilities", "Other",
-]
-
-# Keyword rules for lightweight topic classification (no second model)
-TOPIC_KEYWORDS = {
-    "Analyst Ratings": ["analyst", "upgrade", "downgrade", "rating", "target price", "buy", "sell", "hold"],
-    "Banking": ["bank", "banking", "lender", "loan", "deposit", "branch", "mortgage"],
-    "Commodities": ["gold", "oil", "copper", "commodity", "commodities", "silver", "wheat"],
-    "Company Earnings": ["earnings", "profit", "revenue", "net income", "eps", "quarter", "q1", "q2", "q3", "q4", "beats", "misses"],
-    "Corporate Governance": ["board", "ceo", "cfo", "governance", "shareholder", "proxy", "director"],
-    "Cryptocurrency": ["crypto", "bitcoin", "ethereum", "blockchain", "stablecoin", "token", "exchange"],
-    "Economy": ["gdp", "inflation", "unemployment", "recession", "economic", "fed", "central bank", "rate cut", "rate hike"],
-    "Energy": ["energy", "power", "solar", "wind", "renewable", "utility", "electricity"],
-    "Financial Markets": ["market", "stocks", "equities", "bond", "yield", "index", "s&p", "nasdaq", "dow"],
-    "Healthcare": ["health", "pharma", "drug", "hospital", "medical", "biotech", "fda"],
-    "Legal/Regulation": ["regulator", "regulation", "fine", "penalty", "lawsuit", "court", "compliance", "aml", "investigation", "probe"],
-    "M&A": ["merger", "acquisition", "acquire", "takeover", "deal", "buyout", "m&a"],
-    "Real Estate": ["real estate", "property", "housing", "reit", "construction"],
-    "Retail": ["retail", "consumer", "store", "e-commerce", "shopping", "sales"],
-    "Technology": ["tech", "software", "ai", "cloud", "chip", "semiconductor", "digital"],
-    "Telecommunications": ["telecom", "5g", "wireless", "broadband", "network"],
-    "Trade": ["trade", "tariff", "export", "import", "supply chain", "sanction"],
-    "Transportation": ["transport", "airline", "shipping", "logistics", "rail", "freight"],
-    "Utilities": ["utility", "water", "gas", "electric", "pipeline"],
+# 标准化标签：把不同模型输出的标签统一成 Positive / Neutral / Negative
+SENTIMENT_NORMALIZE = {
+    "positive": "Positive",
+    "negative": "Negative",
+    "neutral": "Neutral",
+    "label_0": "Negative",
+    "label_1": "Neutral",
+    "label_2": "Positive",
 }
 
 
 # ============================================================
-# Model loading
+# Model loading (cached)
 # ============================================================
 @st.cache_resource(show_spinner="Loading financial sentiment model...")
 def load_sentiment_model():
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(SENTIMENT_MODEL_NAME)
-        model = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL_NAME)
-        model.eval()
-        return tokenizer, model
-    except Exception as e:
-        st.error(f"Failed to load sentiment model: {e}")
-        return None, None
+    tokenizer = AutoTokenizer.from_pretrained(SENTIMENT_MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL_NAME)
+    model.eval()
+    return tokenizer, model
 
 
 @st.cache_resource(show_spinner="Loading topic classifier...")
 def load_topic_model():
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(TOPIC_MODEL_NAME)
-        model = AutoModelForSequenceClassification.from_pretrained(TOPIC_MODEL_NAME)
-        model.eval()
-        return tokenizer, model
-    except Exception as e:
-        st.warning(f"Topic model unavailable, using keyword fallback. ({e})")
-        return None, None
+    tokenizer = AutoTokenizer.from_pretrained(TOPIC_MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(TOPIC_MODEL_NAME)
+    model.eval()
+    return tokenizer, model
 
 
 # ============================================================
-# Inference functions
+# Inference
 # ============================================================
 def predict_sentiment(text, tokenizer, model):
-    if tokenizer is None or model is None:
-        return "Neutral", 0.0
-    try:
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
-        with torch.no_grad():
-            logits = model(**inputs).logits
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-        pred_id = torch.argmax(probs, dim=-1).item()
-        confidence = probs[0][pred_id].item()
-        id2label = model.config.id2label
-        label = id2label.get(pred_id, "Neutral")
-        label = label.capitalize()
-        if label not in SENTIMENT_COLOR_MAP:
-            label = "Neutral"
-        return label, round(confidence, 2)
-    except Exception:
-        return "Neutral", 0.0
-
-
-def predict_topic_keyword(text):
-    """Lightweight keyword-based topic classifier (no model needed)."""
-    text_lower = text.lower()
-    scores = {}
-    for topic, keywords in TOPIC_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in text_lower)
-        if score > 0:
-            scores[topic] = score
-    if not scores:
-        return "Other", 0.3
-    best_topic = max(scores, key=scores.get)
-    total_hits = sum(scores.values())
-    confidence = min(0.5 + 0.1 * scores[best_topic], 0.95)
-    return best_topic, round(confidence, 2)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
+    with torch.no_grad():
+        logits = model(**inputs).logits
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+    pred_id = torch.argmax(probs, dim=-1).item()
+    confidence = probs[0][pred_id].item()
+    raw_label = model.config.id2label.get(pred_id, "neutral")
+    label = SENTIMENT_NORMALIZE.get(str(raw_label).lower(), "Neutral")
+    return label, round(confidence, 2)
 
 
 def predict_topic(text, tokenizer, model):
-    """Use model if available, else fallback to keyword rules."""
-    if tokenizer is None or model is None:
-        return predict_topic_keyword(text)
-    try:
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
-        with torch.no_grad():
-            logits = model(**inputs).logits
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-        pred_id = torch.argmax(probs, dim=-1).item()
-        confidence = probs[0][pred_id].item()
-        id2label = model.config.id2label
-        label = id2label.get(pred_id, f"Topic_{pred_id}")
-        return label, round(confidence, 2)
-    except Exception:
-        return predict_topic_keyword(text)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
+    with torch.no_grad():
+        logits = model(**inputs).logits
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+    pred_id = torch.argmax(probs, dim=-1).item()
+    confidence = probs[0][pred_id].item()
+    label = model.config.id2label.get(pred_id, f"Topic_{pred_id}")
+    return label, round(confidence, 2)
 
 
 # ============================================================
-# Mock news generator
+# Mock news (only headlines; model assigns sentiment/topic)
 # ============================================================
 @st.cache_data
 def generate_mock_news(n=60):
@@ -196,8 +131,7 @@ def generate_mock_news(n=60):
             "source": random.choice(sources),
             "timestamp": timestamp,
             "entity": entity,
-            "snippet": f"{title}. Full article content would appear here in production. "
-                       f"This is simulated data for local deployment testing.",
+            "snippet": f"{title}. Full article content would appear here in production.",
         })
 
     df = pd.DataFrame(rows).sort_values("timestamp", ascending=False).reset_index(drop=True)
@@ -210,12 +144,19 @@ def generate_mock_news(n=60):
 def enrich_news_with_models(df, sent_tok, sent_model, topic_tok, topic_model):
     sentiments, topics, sent_confs, topic_confs = [], [], [], []
 
-    progress = st.progress(0, text="Running inference on news...")
+    progress = st.progress(0, text="Running deep learning inference on news...")
     total = len(df)
 
     for i, text in enumerate(df["title"]):
-        s_label, s_conf = predict_sentiment(text, sent_tok, sent_model)
-        t_label, t_conf = predict_topic(text, topic_tok, topic_model)
+        try:
+            s_label, s_conf = predict_sentiment(text, sent_tok, sent_model)
+        except Exception:
+            s_label, s_conf = "Neutral", 0.0
+
+        try:
+            t_label, t_conf = predict_topic(text, topic_tok, topic_model)
+        except Exception:
+            t_label, t_conf = "Other", 0.0
 
         sentiments.append(s_label)
         topics.append(t_label)
@@ -235,7 +176,7 @@ def enrich_news_with_models(df, sent_tok, sent_model, topic_tok, topic_model):
 
 
 # ============================================================
-# Alert generation
+# Alerts
 # ============================================================
 def generate_alerts(df):
     alerts = []
@@ -360,44 +301,38 @@ def render_dashboard(filtered_news, alerts_df):
     with chart_col1:
         st.subheader("Sentiment Trend (Last 24 Hours)")
         trend_df = filtered_news.copy()
-        if not trend_df.empty:
-            trend_df["hour"] = trend_df["timestamp"].dt.floor("h")
-            trend_pivot = trend_df.groupby(["hour", "sentiment"]).size().unstack(fill_value=0)
+        trend_df["hour"] = trend_df["timestamp"].dt.floor("h")
+        trend_pivot = trend_df.groupby(["hour", "sentiment"]).size().unstack(fill_value=0)
 
-            fig_trend = go.Figure()
-            for sentiment in ["Positive", "Neutral", "Negative"]:
-                if sentiment in trend_pivot.columns:
-                    fig_trend.add_trace(go.Scatter(
-                        x=trend_pivot.index,
-                        y=trend_pivot[sentiment],
-                        mode="lines+markers",
-                        name=sentiment,
-                        line=dict(color=SENTIMENT_COLOR_MAP[sentiment], width=2),
-                    ))
-            fig_trend.update_layout(
-                height=350,
-                margin=dict(l=20, r=20, t=20, b=20),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            )
-            st.plotly_chart(fig_trend, use_container_width=True)
-        else:
-            st.info("No data in current filter.")
+        fig_trend = go.Figure()
+        for sentiment in ["Positive", "Neutral", "Negative"]:
+            if sentiment in trend_pivot.columns:
+                fig_trend.add_trace(go.Scatter(
+                    x=trend_pivot.index,
+                    y=trend_pivot[sentiment],
+                    mode="lines+markers",
+                    name=sentiment,
+                    line=dict(color=SENTIMENT_COLOR_MAP[sentiment], width=2),
+                ))
+        fig_trend.update_layout(
+            height=350,
+            margin=dict(l=20, r=20, t=20, b=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_trend, use_container_width=True)
 
     with chart_col2:
         st.subheader("Sentiment Distribution")
-        if not filtered_news.empty:
-            dist = filtered_news["sentiment"].value_counts().reset_index()
-            dist.columns = ["Sentiment", "Count"]
-            fig_pie = px.pie(
-                dist, names="Sentiment", values="Count",
-                color="Sentiment",
-                color_discrete_map=SENTIMENT_COLOR_MAP,
-                hole=0.45,
-            )
-            fig_pie.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20))
-            st.plotly_chart(fig_pie, use_container_width=True)
-        else:
-            st.info("No data in current filter.")
+        dist = filtered_news["sentiment"].value_counts().reset_index()
+        dist.columns = ["Sentiment", "Count"]
+        fig_pie = px.pie(
+            dist, names="Sentiment", values="Count",
+            color="Sentiment",
+            color_discrete_map=SENTIMENT_COLOR_MAP,
+            hole=0.45,
+        )
+        fig_pie.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20))
+        st.plotly_chart(fig_pie, use_container_width=True)
 
     st.divider()
 
@@ -426,14 +361,11 @@ def render_dashboard(filtered_news, alerts_df):
     st.divider()
 
     st.subheader("📰 Latest News")
-    if not filtered_news.empty:
-        display_df = filtered_news.head(15)[
-            ["title", "source", "timestamp", "sentiment", "topic", "sentiment_confidence"]
-        ].copy()
-        display_df["timestamp"] = display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No news matches current filters.")
+    display_df = filtered_news.head(15)[
+        ["title", "source", "timestamp", "sentiment", "topic", "sentiment_confidence"]
+    ].copy()
+    display_df["timestamp"] = display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
 # ============================================================
@@ -470,7 +402,7 @@ def render_news_search(filtered_news):
                     f"- Topic: `{row['topic']}` "
                     f"(confidence {row['topic_confidence']})\n"
                     f"- Entity: `{row['entity']}`\n"
-                    f"- Model: `{SENTIMENT_MODEL_NAME}`"
+                    f"- Model: `{SENTIMENT_MODEL_NAME}` / `{TOPIC_MODEL_NAME}`"
                 )
 
 
@@ -486,28 +418,29 @@ def render_alert_center(alerts_df, news_df):
         st.subheader("Alert History")
         if alerts_df.empty:
             st.info("No alerts generated from current data.")
-        else:
-            status_filter = st.multiselect(
-                "Filter by status",
-                options=["Unresolved", "Resolved", "Ignored"],
-                default=["Unresolved", "Resolved", "Ignored"],
-            )
-            display_alerts = alerts_df[alerts_df["status"].isin(status_filter)]
+            return
 
-            for _, row in display_alerts.iterrows():
-                severity_color = "#e74c3c" if row["severity"] == "High" else "#e67e22"
-                with st.container(border=True):
-                    st.markdown(
-                        f"<span style='color:{severity_color}; font-weight:bold;'>"
-                        f"● {row['severity']} Priority</span> | {row['sentiment']} | "
-                        f"{row['topic']} | {row['timestamp'].strftime('%Y-%m-%d %H:%M')}",
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(f"**{row['title']}**")
-                    st.caption(
-                        f"Source: {row['source']} | Confidence: {row['confidence']} | "
-                        f"Entity: {row['entity']} | Status: {row['status']}"
-                    )
+        status_filter = st.multiselect(
+            "Filter by status",
+            options=["Unresolved", "Resolved", "Ignored"],
+            default=["Unresolved", "Resolved", "Ignored"],
+        )
+        display_alerts = alerts_df[alerts_df["status"].isin(status_filter)]
+
+        for _, row in display_alerts.iterrows():
+            severity_color = "#e74c3c" if row["severity"] == "High" else "#e67e22"
+            with st.container(border=True):
+                st.markdown(
+                    f"<span style='color:{severity_color}; font-weight:bold;'>"
+                    f"● {row['severity']} Priority</span> | {row['sentiment']} | "
+                    f"{row['topic']} | {row['timestamp'].strftime('%Y-%m-%d %H:%M')}",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"**{row['title']}**")
+                st.caption(
+                    f"Source: {row['source']} | Confidence: {row['confidence']} | "
+                    f"Entity: {row['entity']} | Status: {row['status']}"
+                )
 
     with tab2:
         st.subheader("Create Alert Rule")
@@ -623,27 +556,22 @@ def main():
         initial_sidebar_state="expanded",
     )
 
-    # Load sentiment model (required)
+    # Login to Hugging Face if token is available in Streamlit secrets
+    try:
+        if "HF_TOKEN" in st.secrets:
+            from huggingface_hub import login
+            login(token=st.secrets["HF_TOKEN"])
+    except Exception:
+        pass
+
+    # Load models
     sent_tok, sent_model = load_sentiment_model()
+    topic_tok, topic_model = load_topic_model()
 
-    # Topic model toggle (optional, saves RAM on free tier)
-    st.sidebar.markdown("---")
-    use_topic_model = st.sidebar.checkbox(
-        "Load topic model (uses more RAM)",
-        value=False,
-        help="Uncheck to use fast keyword-based topic classification instead.",
-    )
-
-    if use_topic_model:
-        topic_tok, topic_model = load_topic_model()
-    else:
-        topic_tok, topic_model = None, None
-        st.sidebar.caption("Using keyword-based topic classifier.")
-
-    # Generate mock news
+    # Generate mock headlines
     raw_news = generate_mock_news(60)
 
-    # Run inference (cached)
+    # Run inference (cached so it only runs once per session)
     @st.cache_data(show_spinner=False)
     def get_enriched_news(_sent_tok, _sent_model, _topic_tok, _topic_model, raw_df):
         return enrich_news_with_models(
@@ -680,7 +608,8 @@ def main():
     # Footer
     st.sidebar.divider()
     st.sidebar.caption("Bank News Sentiment Analysis v0.3")
-    st.sidebar.caption(f"Model: `{SENTIMENT_MODEL_NAME}`")
+    st.sidebar.caption(f"Sentiment model: `{SENTIMENT_MODEL_NAME}`")
+    st.sidebar.caption(f"Topic model: `{TOPIC_MODEL_NAME}`")
 
 
 if __name__ == "__main__":
