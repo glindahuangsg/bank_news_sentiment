@@ -1,7 +1,9 @@
 import os
 import random
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 
+import feedparser
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -23,7 +25,6 @@ SENTIMENT_COLOR_MAP = {
     "Negative": "#e74c3c",
 }
 
-# 标准化标签：把不同模型输出的标签统一成 Positive / Neutral / Negative
 SENTIMENT_NORMALIZE = {
     "positive": "Positive",
     "negative": "Negative",
@@ -32,6 +33,15 @@ SENTIMENT_NORMALIZE = {
     "label_1": "Neutral",
     "label_2": "Positive",
 }
+
+RSS_FEEDS = [
+    ("Reuters Business", "https://feeds.reuters.com/reuters/businessNews"),
+    ("Reuters Companies", "https://feeds.reuters.com/reuters/companyNews"),
+    ("SEC Press Releases",
+     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=&dateb=&owner=include&count=40&output=atom"),
+    ("Federal Reserve", "https://www.federalreserve.gov/feeds/press_all.xml"),
+    ("Atlanta Fed", "https://www.atlantafed.org/rss/"),
+]
 
 
 # ============================================================
@@ -80,59 +90,63 @@ def predict_topic(text, tokenizer, model):
 
 
 # ============================================================
-# Mock news (only headlines; model assigns sentiment/topic)
+# Real news via RSS
 # ============================================================
-@st.cache_data
-def generate_mock_news(n=60):
-    random.seed(42)
-    np.random.seed(42)
-
-    sources = ["Reuters", "Bloomberg", "Financial Times", "WSJ",
-               "Central Bank Website", "Securities Daily", "Caixin",
-               "Xinhua", "CNBC", "The Economist"]
-
-    entities = ["Our Bank", "Competitor A", "Competitor B", "Regulator", "Key Client"]
-
-    headlines = [
-        "Central bank imposes fine on {entity} for AML violations",
-        "New capital adequacy rules announced for commercial banks",
-        "Regulator tightens scrutiny on wealth management products",
-        "{entity} faces surge in customer complaints over wealth products",
-        "Data breach reported at {entity} branch",
-        "Loan default rate rises at {entity} in Q3",
-        "Central bank cuts reserve requirement ratio by 25bps",
-        "GDP growth beats expectations in Q3",
-        "Inflation remains stable at 2.1%",
-        "Banking sector sees consolidation amid digital transformation",
-        "Fintech partnerships accelerate across major banks",
-        "Green finance initiatives expand in banking sector",
-        "{entity} reports net profit up 5% in Q3",
-        "{entity} beats earnings estimates on strong loan growth",
-        "{entity} net interest margin narrows slightly",
-        "{entity} announces dividend increase",
-        "{entity} launches new digital banking platform",
-        "Analysts upgrade {entity} on improved outlook",
-        "{entity} faces regulatory probe over mortgage practices",
-        "Cybersecurity incident disrupts {entity} online services",
-    ]
-
-    now = datetime.now()
+@st.cache_data(ttl=300, show_spinner="Fetching live news from RSS feeds...")
+def fetch_real_news():
     rows = []
-    for i in range(n):
-        entity = random.choice(entities)
-        template = random.choice(headlines)
-        title = template.format(entity=entity)
-        minutes_ago = random.randint(1, 1440)
-        timestamp = now - timedelta(minutes=minutes_ago)
+    news_id = 0
+    failed_sources = []
 
-        rows.append({
-            "id": i + 1,
-            "title": title,
-            "source": random.choice(sources),
-            "timestamp": timestamp,
-            "entity": entity,
-            "snippet": f"{title}. Full article content would appear here in production.",
-        })
+    for source_name, rss_url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(rss_url)
+            if not feed.entries:
+                failed_sources.append(source_name)
+                continue
+
+            for entry in feed.entries[:15]:
+                news_id += 1
+                title = entry.get("title", "").strip()
+                link = entry.get("link", "")
+                published = entry.get("published", "")
+                summary = entry.get("summary", "")
+                # 去掉 HTML 标签（简单处理）
+                summary = summary.replace("<p>", "").replace("</p>", "")
+                summary = summary.replace("<br>", " ").replace("<br/>", " ")
+                summary = summary[:400]
+
+                try:
+                    ts = parsedate_to_datetime(published)
+                    if ts.tzinfo:
+                        ts = ts.replace(tzinfo=None)
+                except Exception:
+                    ts = datetime.now()
+
+                if not title:
+                    continue
+
+                rows.append({
+                    "id": news_id,
+                    "title": title,
+                    "source": source_name,
+                    "timestamp": ts,
+                    "entity": "Unknown",
+                    "snippet": summary if summary else title,
+                    "link": link,
+                })
+        except Exception:
+            failed_sources.append(source_name)
+            continue
+
+    if failed_sources:
+        st.sidebar.warning(f"Failed RSS sources: {', '.join(failed_sources)}")
+
+    if not rows:
+        st.error("All RSS feeds failed. Please check network or feed URLs.")
+        return pd.DataFrame(columns=[
+            "id", "title", "source", "timestamp", "entity", "snippet", "link"
+        ])
 
     df = pd.DataFrame(rows).sort_values("timestamp", ascending=False).reset_index(drop=True)
     return df
@@ -142,6 +156,9 @@ def generate_mock_news(n=60):
 # Enrich news with model predictions
 # ============================================================
 def enrich_news_with_models(df, sent_tok, sent_model, topic_tok, topic_model):
+    if df.empty:
+        return df
+
     sentiments, topics, sent_confs, topic_confs = [], [], [], []
 
     progress = st.progress(0, text="Running deep learning inference on news...")
@@ -179,6 +196,12 @@ def enrich_news_with_models(df, sent_tok, sent_model, topic_tok, topic_model):
 # Alerts
 # ============================================================
 def generate_alerts(df):
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "id", "severity", "sentiment", "topic", "title", "source",
+            "timestamp", "confidence", "entity", "status"
+        ])
+
     alerts = []
     negative_df = df[df["sentiment"] == "Negative"].head(10)
     for _, row in negative_df.iterrows():
@@ -194,11 +217,13 @@ def generate_alerts(df):
             "entity": row["entity"],
             "status": random.choice(["Unresolved", "Resolved", "Ignored"]),
         })
+
     if not alerts:
         return pd.DataFrame(columns=[
             "id", "severity", "sentiment", "topic", "title", "source",
             "timestamp", "confidence", "entity", "status"
         ])
+
     return pd.DataFrame(alerts).sort_values("timestamp", ascending=False).reset_index(drop=True)
 
 
@@ -211,13 +236,13 @@ def render_sidebar_filters(news_df):
     time_range = st.sidebar.radio(
         "Time Range",
         ["Last 1 hour", "Last 6 hours", "Last 24 hours", "All"],
-        index=2,
+        index=3,
     )
 
     topic_filter = st.sidebar.multiselect(
         "Topic",
-        options=sorted(news_df["topic"].unique()),
-        default=sorted(news_df["topic"].unique()),
+        options=sorted(news_df["topic"].unique()) if not news_df.empty else [],
+        default=sorted(news_df["topic"].unique()) if not news_df.empty else [],
     )
 
     sentiment_filter = st.sidebar.multiselect(
@@ -228,8 +253,8 @@ def render_sidebar_filters(news_df):
 
     entity_filter = st.sidebar.multiselect(
         "Entity",
-        options=sorted(news_df["entity"].unique()),
-        default=sorted(news_df["entity"].unique()),
+        options=sorted(news_df["entity"].unique()) if not news_df.empty else [],
+        default=sorted(news_df["entity"].unique()) if not news_df.empty else [],
     )
 
     keyword = st.sidebar.text_input("Keyword Search", "")
@@ -238,6 +263,9 @@ def render_sidebar_filters(news_df):
 
 
 def apply_filters(df, time_range, topic_filter, sentiment_filter, entity_filter, keyword):
+    if df.empty:
+        return df
+
     filtered = df.copy()
     now = datetime.now()
 
@@ -248,9 +276,12 @@ def apply_filters(df, time_range, topic_filter, sentiment_filter, entity_filter,
     elif time_range == "Last 24 hours":
         filtered = filtered[filtered["timestamp"] >= now - timedelta(hours=24)]
 
-    filtered = filtered[filtered["topic"].isin(topic_filter)]
-    filtered = filtered[filtered["sentiment"].isin(sentiment_filter)]
-    filtered = filtered[filtered["entity"].isin(entity_filter)]
+    if topic_filter:
+        filtered = filtered[filtered["topic"].isin(topic_filter)]
+    if sentiment_filter:
+        filtered = filtered[filtered["sentiment"].isin(sentiment_filter)]
+    if entity_filter:
+        filtered = filtered[filtered["entity"].isin(entity_filter)]
 
     if keyword:
         filtered = filtered[
@@ -267,7 +298,7 @@ def apply_filters(df, time_range, topic_filter, sentiment_filter, entity_filter,
 def render_dashboard(filtered_news, alerts_df):
     st.title("🏦 Bank News Sentiment Dashboard")
     st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-               f"Deep learning inference via Hugging Face")
+               f"Live RSS + deep learning inference")
 
     total_news = len(filtered_news)
     neg_count = len(filtered_news[filtered_news["sentiment"] == "Negative"])
@@ -300,39 +331,45 @@ def render_dashboard(filtered_news, alerts_df):
 
     with chart_col1:
         st.subheader("Sentiment Trend (Last 24 Hours)")
-        trend_df = filtered_news.copy()
-        trend_df["hour"] = trend_df["timestamp"].dt.floor("h")
-        trend_pivot = trend_df.groupby(["hour", "sentiment"]).size().unstack(fill_value=0)
+        if not filtered_news.empty:
+            trend_df = filtered_news.copy()
+            trend_df["hour"] = trend_df["timestamp"].dt.floor("h")
+            trend_pivot = trend_df.groupby(["hour", "sentiment"]).size().unstack(fill_value=0)
 
-        fig_trend = go.Figure()
-        for sentiment in ["Positive", "Neutral", "Negative"]:
-            if sentiment in trend_pivot.columns:
-                fig_trend.add_trace(go.Scatter(
-                    x=trend_pivot.index,
-                    y=trend_pivot[sentiment],
-                    mode="lines+markers",
-                    name=sentiment,
-                    line=dict(color=SENTIMENT_COLOR_MAP[sentiment], width=2),
-                ))
-        fig_trend.update_layout(
-            height=350,
-            margin=dict(l=20, r=20, t=20, b=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        )
-        st.plotly_chart(fig_trend, use_container_width=True)
+            fig_trend = go.Figure()
+            for sentiment in ["Positive", "Neutral", "Negative"]:
+                if sentiment in trend_pivot.columns:
+                    fig_trend.add_trace(go.Scatter(
+                        x=trend_pivot.index,
+                        y=trend_pivot[sentiment],
+                        mode="lines+markers",
+                        name=sentiment,
+                        line=dict(color=SENTIMENT_COLOR_MAP[sentiment], width=2),
+                    ))
+            fig_trend.update_layout(
+                height=350,
+                margin=dict(l=20, r=20, t=20, b=20),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_trend, use_container_width=True)
+        else:
+            st.info("No data to display.")
 
     with chart_col2:
         st.subheader("Sentiment Distribution")
-        dist = filtered_news["sentiment"].value_counts().reset_index()
-        dist.columns = ["Sentiment", "Count"]
-        fig_pie = px.pie(
-            dist, names="Sentiment", values="Count",
-            color="Sentiment",
-            color_discrete_map=SENTIMENT_COLOR_MAP,
-            hole=0.45,
-        )
-        fig_pie.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20))
-        st.plotly_chart(fig_pie, use_container_width=True)
+        if not filtered_news.empty:
+            dist = filtered_news["sentiment"].value_counts().reset_index()
+            dist.columns = ["Sentiment", "Count"]
+            fig_pie = px.pie(
+                dist, names="Sentiment", values="Count",
+                color="Sentiment",
+                color_discrete_map=SENTIMENT_COLOR_MAP,
+                hole=0.45,
+            )
+            fig_pie.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20))
+            st.plotly_chart(fig_pie, use_container_width=True)
+        else:
+            st.info("No data to display.")
 
     st.divider()
 
@@ -361,11 +398,14 @@ def render_dashboard(filtered_news, alerts_df):
     st.divider()
 
     st.subheader("📰 Latest News")
-    display_df = filtered_news.head(15)[
-        ["title", "source", "timestamp", "sentiment", "topic", "sentiment_confidence"]
-    ].copy()
-    display_df["timestamp"] = display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    if not filtered_news.empty:
+        display_df = filtered_news.head(15)[
+            ["title", "source", "timestamp", "sentiment", "topic", "sentiment_confidence"]
+        ].copy()
+        display_df["timestamp"] = display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No news available.")
 
 
 # ============================================================
@@ -395,6 +435,8 @@ def render_news_search(filtered_news):
             )
             with st.expander("View snippet & model analysis"):
                 st.write(row["snippet"])
+                if row.get("link"):
+                    st.markdown(f"[Read full article]({row['link']})")
                 st.markdown("**Model judgment basis:**")
                 st.markdown(
                     f"- Sentiment: `{row['sentiment']}` "
@@ -457,14 +499,14 @@ def render_alert_center(alerts_df, news_df):
                 )
                 st.multiselect(
                     "Topic is",
-                    sorted(news_df["topic"].unique()),
-                    default=sorted(news_df["topic"].unique())[:2],
+                    sorted(news_df["topic"].unique()) if not news_df.empty else [],
+                    default=sorted(news_df["topic"].unique())[:2] if not news_df.empty else [],
                 )
             with c2:
                 st.multiselect(
                     "Entity is",
-                    sorted(news_df["entity"].unique()),
-                    default=["Our Bank"],
+                    sorted(news_df["entity"].unique()) if not news_df.empty else [],
+                    default=sorted(news_df["entity"].unique())[:1] if not news_df.empty else [],
                 )
                 st.number_input(
                     "Volume threshold (similar reports within 1 hour)",
@@ -500,7 +542,7 @@ def render_report_generator(filtered_news, alerts_df):
 
         st.subheader("1. Overview")
         total = len(filtered_news)
-        neg = len(filtered_news[filtered_news["sentiment"] == "Negative"])
+        neg = len(filtered_news[filtered_news["sentiment"] == "Negative"]) if total > 0 else 0
         neg_pct = (neg / total * 100) if total > 0 else 0
         high_alerts = len(alerts_df[alerts_df["severity"] == "High"]) if not alerts_df.empty else 0
 
@@ -512,7 +554,7 @@ def render_report_generator(filtered_news, alerts_df):
         )
 
         st.subheader("2. Key Events")
-        key_events = filtered_news[filtered_news["sentiment"] == "Negative"].head(5)
+        key_events = filtered_news[filtered_news["sentiment"] == "Negative"].head(5) if total > 0 else pd.DataFrame()
         if key_events.empty:
             st.info("No negative events in current filter.")
         else:
@@ -568,8 +610,12 @@ def main():
     sent_tok, sent_model = load_sentiment_model()
     topic_tok, topic_model = load_topic_model()
 
-    # Generate mock headlines
-    raw_news = generate_mock_news(60)
+    # Fetch real news from RSS
+    raw_news = fetch_real_news()
+
+    if raw_news.empty:
+        st.error("No news could be fetched from any RSS source. Please try again later.")
+        st.stop()
 
     # Run inference (cached so it only runs once per session)
     @st.cache_data(show_spinner=False)
@@ -607,9 +653,10 @@ def main():
 
     # Footer
     st.sidebar.divider()
-    st.sidebar.caption("Bank News Sentiment Analysis v0.3")
+    st.sidebar.caption("Bank News Sentiment Analysis v0.4")
     st.sidebar.caption(f"Sentiment model: `{SENTIMENT_MODEL_NAME}`")
     st.sidebar.caption(f"Topic model: `{TOPIC_MODEL_NAME}`")
+    st.sidebar.caption("Data source: Live RSS feeds")
 
 
 if __name__ == "__main__":
